@@ -68,7 +68,7 @@ pub fn compose_lens(item: TokenStream) -> TokenStream {
                     #(#field_names_tys),*
                 }
 
-                impl<T, #(#generics),*> Lens<T, #name> for LensCompose<#(#generics),*>
+                impl<T, #(#generics),*> ::druid::Lens<T, #name> for LensCompose<#(#generics),*>
                 where
                     #(#wheres),*
                 {
