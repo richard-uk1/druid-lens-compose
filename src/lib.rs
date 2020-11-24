@@ -47,6 +47,18 @@ pub fn compose_lens(item: TokenStream) -> TokenStream {
     let lets = field_names
         .iter()
         .map(|name| quote!(let #name = self.#name.with(data, |v| v.clone());));
+    let let_muts = field_names
+        .iter()
+        .map(|name| quote!(let mut #name = self.#name.with(data, |v| v.clone());));
+    let assigns = field_names.iter().map(|name| {
+        quote!(
+            self.#name.with_mut(data, |v| {
+                if !::druid::Data::same(&#name, v) {
+                    *v = #name;
+                }
+            });
+        )
+    });
     TokenStream::from(quote! {
         impl #name {
             pub fn compose_lens<T>(
@@ -66,7 +78,12 @@ pub fn compose_lens(item: TokenStream) -> TokenStream {
                         f(&_widget_data)
                     }
                     fn with_mut<V, F: FnOnce(&mut #name) -> V>(&self, data: &mut T, f: F) -> V {
-                        todo!()
+                        #(#let_muts)*
+                        let mut _widget_data = #name { #(#field_names),* };
+                        let output = f(&mut _widget_data);
+                        let #name { #(#field_names),* } = _widget_data;
+                        #(#assigns)*
+                        output
                     }
                 }
 
