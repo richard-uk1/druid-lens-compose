@@ -1,16 +1,23 @@
+/// TODO add optional fields after the never type is stabilized with `!` fallback.
 use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
+use std::iter;
 use syn::{
     parse::{Error, Parse, ParseStream},
     parse_macro_input,
     spanned::Spanned,
-    Fields, Ident, ItemStruct, Result, Type,
+    Fields, GenericParam, Ident, ItemStruct, Result, Type,
 };
 
 #[proc_macro_derive(ComposeLens)]
 pub fn compose_lens(item: TokenStream) -> TokenStream {
     let compose_lens = parse_macro_input!(item as ComposeLens);
+    let inner_generics = &compose_lens.generics;
+    let inner_generics_constraints: Vec<_> = inner_generics
+        .iter()
+        .map(|ty| quote!(#ty: Clone + ::druid::Data))
+        .collect();
     let name = &compose_lens.name;
     let field_names: Vec<_> = compose_lens
         .fields
@@ -33,23 +40,27 @@ pub fn compose_lens(item: TokenStream) -> TokenStream {
         .collect();
     let generics: Vec<_> = (0..field_names.len())
         .into_iter()
-        .map(|n| Ident::new(&format!("L{}", n), Span::call_site()))
+        .map(|n| Ident::new(&format!("_L{}", n), Span::call_site()))
         .collect();
     let field_names_tys: Vec<_> = generics
         .iter()
         .zip(field_names.iter())
         .map(|(ty, name)| quote!(#name: #ty))
         .collect();
-    let wheres = generics
+    let wheres = inner_generics_constraints.iter().cloned().chain(
+        generics
+            .iter()
+            .zip(lenses.iter())
+            .map(|(generic, lens)| quote!(#generic: #lens)),
+    );
+    let all_generics: Vec<_> = iter::once(Ident::new("T", Span::call_site()))
+        .chain(inner_generics.iter().cloned())
+        .chain(generics.iter().cloned())
+        .collect();
+    let lets: Vec<_> = field_names
         .iter()
-        .zip(lenses.iter())
-        .map(|(generic, lens)| quote!(#generic: #lens));
-    let lets = field_names
-        .iter()
-        .map(|name| quote!(let #name = self.#name.with(data, |v| v.clone());));
-    let let_muts = field_names
-        .iter()
-        .map(|name| quote!(let mut #name = self.#name.with(data, |v| v.clone());));
+        .map(|name| quote!(let #name = self.#name.with(data, |v| v.clone());))
+        .collect();
     let assigns = field_names.iter().map(|name| {
         quote!(
             self.#name.with_mut(data, |v| {
@@ -60,25 +71,29 @@ pub fn compose_lens(item: TokenStream) -> TokenStream {
         )
     });
     TokenStream::from(quote! {
-        impl #name {
+        impl <#(#inner_generics),*> #name<#(#inner_generics),*>
+        where
+            #(#inner_generics_constraints),*
+        {
+
             pub fn compose_lens<T>(
                 #(#fn_params),*
-            ) -> impl ::druid::Lens<T, #name> {
+            ) -> impl ::druid::Lens<T, #name <#(#inner_generics),*>> {
                 struct LensCompose<#(#generics),*> {
                     #(#field_names_tys),*
                 }
 
-                impl<T, #(#generics),*> ::druid::Lens<T, #name> for LensCompose<#(#generics),*>
+                impl<#(#all_generics),*> ::druid::Lens<T, #name <#(#inner_generics),*>> for LensCompose<#(#generics),*>
                 where
                     #(#wheres),*
                 {
-                    fn with<V, F: FnOnce(&#name) -> V>(&self, data: &T, f: F) -> V {
+                    fn with<V, F: FnOnce(&#name <#(#inner_generics),*>) -> V>(&self, data: &T, f: F) -> V {
                         #(#lets)*
                         let _widget_data = #name { #(#field_names),* };
                         f(&_widget_data)
                     }
-                    fn with_mut<V, F: FnOnce(&mut #name) -> V>(&self, data: &mut T, f: F) -> V {
-                        #(#let_muts)*
+                    fn with_mut<V, F: FnOnce(&mut #name <#(#inner_generics),*>) -> V>(&self, data: &mut T, f: F) -> V {
+                        #(#lets)*
                         let mut _widget_data = #name { #(#field_names),* };
                         let output = f(&mut _widget_data);
                         let #name { #(#field_names),* } = _widget_data;
@@ -95,6 +110,7 @@ pub fn compose_lens(item: TokenStream) -> TokenStream {
 
 struct ComposeLens {
     name: Ident,
+    generics: Vec<Ident>,
     fields: Vec<(Ident, Type)>,
 }
 
@@ -102,12 +118,38 @@ impl Parse for ComposeLens {
     fn parse(input: ParseStream) -> Result<Self> {
         let raw: ItemStruct = input.parse()?;
         let name = raw.ident;
-        if raw.generics.lt_token.is_some() {
+        if let Some(clause) = raw.generics.where_clause {
             return Err(Error::new(
-                raw.generics.span(),
-                "generics not supported on ComposeLens",
+                clause.span(),
+                "no constraints allowed on the struct for now",
             ));
         }
+        let generics = raw
+            .generics
+            .params
+            .iter()
+            .map(|param| match param {
+                GenericParam::Type(param) => {
+                    if !param.attrs.is_empty() {
+                        Err(Error::new(
+                            param.attrs.first().unwrap().span(),
+                            "attributes not supported",
+                        ))
+                    } else if param.colon_token.is_some() {
+                        Err(Error::new(
+                            param.bounds.span(),
+                            "constraints on generic parameters not supported",
+                        ))
+                    } else {
+                        Ok(param.ident.clone())
+                    }
+                }
+                other => Err(Error::new(
+                    other.span(),
+                    "lifetime and const generic parameters not supported",
+                )),
+            })
+            .collect::<Result<Vec<_>>>()?;
         let fields = match raw.fields {
             Fields::Named(f) => f,
             other => {
@@ -122,6 +164,10 @@ impl Parse for ComposeLens {
             .iter()
             .map(|field| (field.ident.as_ref().cloned().unwrap(), field.ty.clone()))
             .collect::<Vec<_>>();
-        Ok(ComposeLens { name, fields })
+        Ok(ComposeLens {
+            name,
+            generics,
+            fields,
+        })
     }
 }

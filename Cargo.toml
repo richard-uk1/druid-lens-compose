@@ -1,15 +1,19 @@
 [package]
 name = "druid-lens-compose"
-version = "0.1.0"
+description = "Build druid lenses out of other lenses."
+version = "0.1.1"
 authors = ["Richard Dodd <richard.o.dodd@gmail.com>"]
 edition = "2018"
+license = "MIT/Apache-2.0"
+repository = "https://github.com/derekdreery/druid-lens-compose"
 
 [lib]
 proc-macro = true
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 syn = { version = "1.0.51", features = ["full" ]}
 quote = "1.0.7"
 proc-macro2 = "1.0.24"
+
+[dev-dependencies]
+druid = { version = "0.6.0", git = "https://github.com/linebender/druid" }
