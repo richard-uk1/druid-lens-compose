@@ -2,12 +2,13 @@
 use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
-use std::iter;
+use std::{fmt::Write, iter};
 use syn::{
     parse::{Error, Parse, ParseStream},
     parse_macro_input,
     spanned::Spanned,
-    Fields, GenericParam, Ident, ItemStruct, Result, Type,
+    visit::Visit,
+    Fields, GenericParam, Ident, ItemStruct, Result, Type, TypeParam,
 };
 
 #[proc_macro_derive(ComposeLens)]
@@ -31,7 +32,7 @@ pub fn compose_lens(item: TokenStream) -> TokenStream {
         .collect();
     let lenses: Vec<_> = field_tys
         .iter()
-        .map(|ty| quote!(::druid::Lens<T, #ty>))
+        .map(|ty| quote!(::druid::Lens<Outer, #ty>))
         .collect();
     let fn_params: Vec<_> = field_names
         .iter()
@@ -53,7 +54,7 @@ pub fn compose_lens(item: TokenStream) -> TokenStream {
             .zip(lenses.iter())
             .map(|(generic, lens)| quote!(#generic: #lens)),
     );
-    let all_generics: Vec<_> = iter::once(Ident::new("T", Span::call_site()))
+    let all_generics: Vec<_> = iter::once(Ident::new("Outer", Span::call_site()))
         .chain(inner_generics.iter().cloned())
         .chain(generics.iter().cloned())
         .collect();
@@ -76,23 +77,23 @@ pub fn compose_lens(item: TokenStream) -> TokenStream {
             #(#inner_generics_constraints),*
         {
 
-            pub fn compose_lens<T>(
+            pub fn compose_lens<Outer>(
                 #(#fn_params),*
-            ) -> impl ::druid::Lens<T, #name <#(#inner_generics),*>> {
+            ) -> impl ::druid::Lens<Outer, #name <#(#inner_generics),*>> {
                 struct LensCompose<#(#generics),*> {
                     #(#field_names_tys),*
                 }
 
-                impl<#(#all_generics),*> ::druid::Lens<T, #name <#(#inner_generics),*>> for LensCompose<#(#generics),*>
+                impl<#(#all_generics),*> ::druid::Lens<Outer, #name <#(#inner_generics),*>> for LensCompose<#(#generics),*>
                 where
                     #(#wheres),*
                 {
-                    fn with<V, F: FnOnce(&#name <#(#inner_generics),*>) -> V>(&self, data: &T, f: F) -> V {
+                    fn with<V, F: FnOnce(&#name <#(#inner_generics),*>) -> V>(&self, data: &Outer, f: F) -> V {
                         #(#lets)*
                         let _widget_data = #name { #(#field_names),* };
                         f(&_widget_data)
                     }
-                    fn with_mut<V, F: FnOnce(&mut #name <#(#inner_generics),*>) -> V>(&self, data: &mut T, f: F) -> V {
+                    fn with_mut<V, F: FnOnce(&mut #name <#(#inner_generics),*>) -> V>(&self, data: &mut Outer, f: F) -> V {
                         #(#lets)*
                         let mut _widget_data = #name { #(#field_names),* };
                         let output = f(&mut _widget_data);
@@ -117,7 +118,20 @@ struct ComposeLens {
 impl Parse for ComposeLens {
     fn parse(input: ParseStream) -> Result<Self> {
         let raw: ItemStruct = input.parse()?;
-        let name = raw.ident;
+        // check the user hasn't used any reserved names for their generics.
+        let mut check_generics = CheckGenerics::new();
+        check_generics.visit_item_struct(&raw);
+        if !check_generics.bad_generics.is_empty() {
+            let mut msg = format!("found type names that might clash: ");
+            let mut it = check_generics.bad_generics.into_iter();
+            let first = it.next().unwrap();
+            write!(msg, "\"{}\"", first).unwrap();
+            for generic in it {
+                write!(msg, ", \"{}\"", generic).unwrap();
+            }
+            return Err(Error::new(first.span(), &msg));
+        }
+        // check params
         if let Some(clause) = raw.generics.where_clause {
             return Err(Error::new(
                 clause.span(),
@@ -164,10 +178,44 @@ impl Parse for ComposeLens {
             .iter()
             .map(|field| (field.ident.as_ref().cloned().unwrap(), field.ty.clone()))
             .collect::<Vec<_>>();
+        let name = raw.ident;
         Ok(ComposeLens {
             name,
             generics,
             fields,
         })
+    }
+}
+
+// Visitor to check that our generic names don't clash with the user's
+
+struct CheckGenerics {
+    bad_generics: Vec<Ident>,
+}
+
+impl CheckGenerics {
+    fn new() -> Self {
+        CheckGenerics {
+            bad_generics: vec![],
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for CheckGenerics {
+    fn visit_type_param(&mut self, i: &'ast TypeParam) {
+        if bad_ident(&i.ident.to_string()) {
+            self.bad_generics.push(i.ident.clone());
+        }
+    }
+}
+
+fn bad_ident(i: &str) -> bool {
+    if i == "Outer" {
+        true
+    } else if i.starts_with("_L") {
+        let num = &i[1..];
+        num.parse::<u64>().is_ok()
+    } else {
+        false
     }
 }
