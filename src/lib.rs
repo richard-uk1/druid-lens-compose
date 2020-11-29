@@ -1,3 +1,4 @@
+use itertools::izip;
 /// TODO add optional fields after the never type is stabilized with `!` fallback.
 use proc_macro::TokenStream;
 use proc_macro2::Span;
@@ -20,6 +21,10 @@ pub fn compose_lens(item: TokenStream) -> TokenStream {
         .map(|ty| quote!(#ty: Clone + ::druid::Data))
         .collect();
     let name = &compose_lens.name;
+    let builder_name = Ident::new(
+        &format!("{}LensBuilder", compose_lens.name),
+        compose_lens.name.span(),
+    );
     let field_names: Vec<_> = compose_lens
         .fields
         .iter()
@@ -34,26 +39,57 @@ pub fn compose_lens(item: TokenStream) -> TokenStream {
         .iter()
         .map(|ty| quote!(::druid::Lens<Outer, #ty>))
         .collect();
-    let fn_params: Vec<_> = field_names
-        .iter()
-        .zip(lenses.iter())
-        .map(|(name, lens)| quote!(#name: impl #lens))
-        .collect();
     let generics: Vec<_> = (0..field_names.len())
         .into_iter()
-        .map(|n| Ident::new(&format!("_L{}", n), Span::call_site()))
+        .map(|n| Ident::new(&format!("L{}", n), Span::call_site()))
+        .collect();
+    let builder_fields: Vec<_> = izip!(field_names.iter(), generics.iter())
+        .map(|(name, ty)| quote!(#name: Option<#ty>))
+        .collect();
+    let builder_fn_doc = format!(
+        "Create a builder object to build a lens for `{}` out of lenses to its fields.",
+        name
+    );
+    let builder_doc = format!(
+        "An object for making `Lens`es for `{}` following the builder pattern.
+
+Once all lenses are set, call `build` to create the lens",
+        name
+    );
+    let builder_field_defaults: Vec<_> =
+        field_names.iter().map(|name| quote!(#name: None)).collect();
+    let builder_field_unwraps: Vec<_> = field_names
+        .iter()
+        .map(|name| quote!(#name: self.#name.unwrap()))
+        .collect();
+    let builder_fns: Vec<_> = izip!(field_names.iter(), generics.iter())
+        .map(|(name, ty)| {
+            let docs = format!("Set the lens for the `{}` field", name);
+            quote! {
+                #[doc = #docs]
+                #[inline]
+                pub fn #name(mut self, #name: #ty) -> Self {
+                    self.#name = Some(#name);
+                    self
+                }
+            }
+        })
         .collect();
     let field_names_tys: Vec<_> = generics
         .iter()
         .zip(field_names.iter())
         .map(|(ty, name)| quote!(#name: #ty))
         .collect();
-    let wheres = inner_generics_constraints.iter().cloned().chain(
-        generics
-            .iter()
-            .zip(lenses.iter())
-            .map(|(generic, lens)| quote!(#generic: #lens)),
-    );
+    let wheres: Vec<_> = inner_generics_constraints
+        .iter()
+        .cloned()
+        .chain(
+            generics
+                .iter()
+                .zip(lenses.iter())
+                .map(|(generic, lens)| quote!(#generic: #lens)),
+        )
+        .collect();
     let all_generics: Vec<_> = iter::once(Ident::new("Outer", Span::call_site()))
         .chain(inner_generics.iter().cloned())
         .chain(generics.iter().cloned())
@@ -71,39 +107,86 @@ pub fn compose_lens(item: TokenStream) -> TokenStream {
             });
         )
     });
+    let lens_name = Ident::new(&format!("{}Lens", name), Span::call_site());
+
     TokenStream::from(quote! {
-        impl <#(#inner_generics),*> #name<#(#inner_generics),*>
+        impl <#(#inner_generics),*> #name<#(#inner_generics),*> {
+            #[doc = #builder_fn_doc]
+            #[inline]
+            pub fn lens_builder<#(#generics),*>() -> #builder_name<#(#generics),*> {
+                #builder_name::new()
+            }
+        }
+
+        #[doc = #builder_doc]
+        #[derive(Copy, Clone)]
+        pub struct #builder_name<#(#generics),*> {
+            #(#builder_fields),*
+        }
+
+        impl<#(#generics),*> #builder_name<#(#generics),*> {
+            #[inline]
+            pub fn new() -> Self {
+                Self { #(#builder_field_defaults),* }
+            }
+
+            #(#builder_fns)*
+
+            /// Builds the lens
+            ///
+            /// # Panics
+            ///
+            /// Panics if any of the field lenses are not set yet.
+            #[inline]
+            pub fn build<Outer, #(#inner_generics),*>(self) -> #lens_name<#(#generics),*>
+            where
+                #(#wheres),*
+            {
+                #lens_name {
+                    #(#builder_field_unwraps),*
+                }
+            }
+        }
+
+        impl<#(#generics),*> Default for #builder_name<#(#generics),*> {
+            #[inline]
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        #[derive(Copy, Clone)]
+        pub struct #lens_name<#(#generics),*> {
+            #(#field_names_tys),*
+        }
+
+        impl<#(#all_generics),*> ::druid::Lens<Outer, #name <#(#inner_generics),*>>
+        for #lens_name<#(#generics),*>
         where
-            #(#inner_generics_constraints),*
+            #(#wheres),*
         {
-
-            pub fn compose_lens<Outer>(
-                #(#fn_params),*
-            ) -> impl ::druid::Lens<Outer, #name <#(#inner_generics),*>> {
-                struct LensCompose<#(#generics),*> {
-                    #(#field_names_tys),*
-                }
-
-                impl<#(#all_generics),*> ::druid::Lens<Outer, #name <#(#inner_generics),*>> for LensCompose<#(#generics),*>
-                where
-                    #(#wheres),*
-                {
-                    fn with<V, F: FnOnce(&#name <#(#inner_generics),*>) -> V>(&self, data: &Outer, f: F) -> V {
-                        #(#lets)*
-                        let _widget_data = #name { #(#field_names),* };
-                        f(&_widget_data)
-                    }
-                    fn with_mut<V, F: FnOnce(&mut #name <#(#inner_generics),*>) -> V>(&self, data: &mut Outer, f: F) -> V {
-                        #(#lets)*
-                        let mut _widget_data = #name { #(#field_names),* };
-                        let output = f(&mut _widget_data);
-                        let #name { #(#field_names),* } = _widget_data;
-                        #(#assigns)*
-                        output
-                    }
-                }
-
-                LensCompose { #(#field_names),* }
+            #[inline]
+            fn with<V, F: FnOnce(&#name <#(#inner_generics),*>) -> V>(
+                &self,
+                data: &Outer,
+                f: F
+            ) -> V {
+                #(#lets)*
+                let _widget_data = #name { #(#field_names),* };
+                f(&_widget_data)
+            }
+            #[inline]
+            fn with_mut<V, F: FnOnce(&mut #name <#(#inner_generics),*>) -> V>(
+                &self,
+                data: &mut Outer,
+                f: F
+            ) -> V {
+                #(#lets)*
+                let mut _widget_data = #name { #(#field_names),* };
+                let output = f(&mut _widget_data);
+                let #name { #(#field_names),* } = _widget_data;
+                #(#assigns)*
+                output
             }
         }
     })
@@ -212,7 +295,7 @@ impl<'ast> Visit<'ast> for CheckGenerics {
 fn bad_ident(i: &str) -> bool {
     if i == "Outer" {
         true
-    } else if i.starts_with("_L") {
+    } else if i.starts_with("L") {
         let num = &i[1..];
         num.parse::<u64>().is_ok()
     } else {
